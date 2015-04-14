@@ -242,20 +242,24 @@ handle_msg(N, Box, #{
     process_recv_queue(State#{ buf := Msg, rc := N+1 }).
 
 handle_vouch(K, 1, Box, #{ socket := Sock, vault := Vault, registry := Registry } = State) ->
+    io:format("handle vouch~n"),
     case unpack_cookie(K) of
         {ok, EC, ESs} ->
             Nonce = st_nonce(initiate, client, 1),
-            {ok, <<C:32/binary, NonceLT:16/binary, Vouch/binary>>} = enacl:box_open(Box, Nonce, EC, ESs),
+            {ok, <<C:32/binary, NonceLT:16/binary, Vouch:48/binary, MetaData/binary>>} = enacl:box_open(Box, Nonce, EC, ESs),
+	    io:format("MetaData: ~p~n", [d_metadata(MetaData)]),
             true = Registry:verify(Sock, C),
             VNonce = lt_nonce(client, NonceLT),
             {ok, <<EC:32/binary>>} = Vault:box_open(Vouch, VNonce, C),
             %% Everything seems to be in order, go to connected state
             NState = State#{ recv_queue => queue:new(), buf => undefined, 
                              secret_key => ESs, peer_public_key => EC, c => 2, rc => 2, side => server },
+	    gen_tcp:send(Sock, e_ready(MetaData, 2, EC, ESs)),
             {next_state, connected, reply(ok, NState)};
         {error, _Reason} = Err ->
             {stop, Err, State}
     end.
+
 
 handle_cookie(N, Box, #{ public_key := EC, secret_key := ECs, peer_lt_public_key := S, socket := Socket, vault := Vault } = State) ->
     Nonce = lt_nonce(server, N),
@@ -292,6 +296,7 @@ st_nonce(initiate, client, N) -> <<"CurveCP-client-I", N:64/integer>>;
 st_nonce(msg, client, N) -> <<"CurveCP-client-M", N:64/integer>>;
 st_nonce(hello, server, N) -> <<"CurveCP-server-H", N:64/integer>>;
 st_nonce(initiate, server, N) -> <<"CurveCP-server-I", N:64/integer>>;
+st_nonce(ready, server, N) -> <<"CurveCP-server-R", N:64/integer>>;
 st_nonce(msg, server, N) -> <<"CurveCP-server-M", N:64/integer>>.
 
 lt_nonce(minute_k, N) -> <<"minute-k", N/binary>>;
@@ -349,6 +354,11 @@ e_vouch(Kookie, VMsg, S, Vault, N, ES, ECs) when byte_size(Kookie) == 96 ->
     STNonce = st_nonce(initiate, client, N),
     Box = enacl:box(<<C:32/binary, NonceBase/binary, VouchBox/binary>>, STNonce, ES, ECs),
     <<108,9,175,178,138,169,250,253, Kookie/binary, N:64/integer, Box/binary>>.
+
+e_ready(MetaData, NonceCount, PK, SK) ->
+    Nonce = st_nonce(ready, server, NonceCount),
+    Box = enacl:box(MetaData, Nonce, PK, SK),
+    <<109,9,175,178,138,169,250,253, NonceCount:64/integer, Box/binary>>.
     
 e_msg(M, Side, NonceCount, PK, SK) ->
     Nonce = st_nonce(msg, Side, NonceCount),
@@ -371,3 +381,17 @@ d_packet(<<108,9,175,178,138,169,250,252, EC:32/binary, N:64/integer, Box/binary
 d_packet(_) ->
     unknown.
     
+d_metadata(MetaData) ->
+    <<Length:8/integer, Rest/binary>> = MetaData,
+    io:format("Length: ~p~n", [Length]),
+    meta_rec(Length, Rest).
+
+meta_rec(0, _) ->
+    [];
+meta_rec(N, Data) ->
+    <<KeyLen:8/integer, KeyValRest/binary>> = Data,
+    <<Key:KeyLen/binary, ValueLen:16/integer, ValRest/binary>> = KeyValRest,
+    <<Value:ValueLen/binary, Rest/binary>> = ValRest,
+    Pair = {Key, Value},
+    io:format("Pair: ~p~n", [Pair]),
+    [ Pair | meta_rec(N-1, Rest) ].
